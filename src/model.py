@@ -6,7 +6,7 @@ def build_point_model():
     from lightgbm import LGBMRegressor
 
     return LGBMRegressor(
-        n_estimators=300,
+        n_estimators=100,
         learning_rate=0.05,
         num_leaves=31,
         random_state=42,
@@ -21,7 +21,7 @@ def build_p80_model():
     return LGBMRegressor(
         objective="quantile",
         alpha=0.80,
-        n_estimators=300,
+        n_estimators=100,
         learning_rate=0.05,
         num_leaves=31,
         random_state=42,

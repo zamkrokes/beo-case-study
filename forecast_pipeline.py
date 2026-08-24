@@ -69,8 +69,11 @@ def add_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
     )
     df["lag_same_workday"] = df["load_model"].reindex(reference_index).to_numpy()
     df["lag672"] = df["load_model"].shift(672)
-    df["rolling_mean_week"] = df["load_model"].shift(1).rolling(672, min_periods=672).mean()
-    df["rolling_max_week"] = df["load_model"].shift(1).rolling(672, min_periods=672).max()
+    # Day-ahead causality: every feature for a forecast day must be fixed
+    # before 00:00.  Shift the seven-day window by one full day (96 points),
+    # rather than one quarter-hour, so it cannot include today's observations.
+    df["rolling_mean_week"] = df["load_model"].shift(96).rolling(672, min_periods=672).mean()
+    df["rolling_max_week"] = df["load_model"].shift(96).rolling(672, min_periods=672).max()
 
     df["minute"] = df.index.minute
     df["hour"] = df.index.hour
@@ -80,7 +83,7 @@ def add_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
     df["weekday_name"] = df.index.day_name()
 
     categorical_features = [
-        "minute", "hour", "day", "month", "weekday", "weekday_name",
+        "minute", "hour", "month", "weekday",
         "is_weekend", "is_holiday", "is_shutdown", "is_workday",
     ]
     for column in categorical_features:
@@ -120,19 +123,21 @@ def rolling_origin_validation(
         result = pd.DataFrame(index=test.index)
         result["actual"] = test["load_target"]
         result["baseline_lag672"] = test["lag672"]
+        result["baseline_same_workday"] = test["lag_same_workday"]
         result["day_type"] = "Weekend" if date.dayofweek >= 5 else "Weekday"
+        result["is_workday"] = bool(test["is_workday"].iloc[0])
         result["is_peak"] = result["actual"] >= train["load_target"].quantile(0.95)
 
         if lightgbm_available:
             model = LGBMRegressor(
-                n_estimators=300, learning_rate=0.05, num_leaves=31,
+                n_estimators=100, learning_rate=0.05, num_leaves=31,
                 random_state=42, verbosity=-1,
             )
             model.fit(train[feature_columns], train["load_target"], categorical_feature=categorical_features)
             result["lightgbm"] = model.predict(test[feature_columns])
 
             p80_model = LGBMRegressor(
-                objective="quantile", alpha=0.80, n_estimators=300,
+                objective="quantile", alpha=0.80, n_estimators=100,
                 learning_rate=0.05, num_leaves=31, random_state=42, verbosity=-1,
             )
             p80_model.fit(train[feature_columns], train["load_target"], categorical_feature=categorical_features)
@@ -140,7 +145,10 @@ def rolling_origin_validation(
         predictions.append(result)
 
     validation_predictions = pd.concat(predictions).dropna(subset=["baseline_lag672"])
-    prediction_columns = {"lag-672 baseline": "baseline_lag672"}
+    prediction_columns = {
+        "lag-672 baseline": "baseline_lag672",
+        "same-workday baseline": "baseline_same_workday",
+    }
     if "lightgbm" in validation_predictions:
         prediction_columns.update({"LightGBM": "lightgbm", "LightGBM P80": "lightgbm_p80"})
 
@@ -150,9 +158,10 @@ def rolling_origin_validation(
     for day_type, group in groups:
         for scope, subset in [("all intervals", group), ("top 5% peaks", group[group["is_peak"]])]:
             for model_name, prediction_column in prediction_columns.items():
-                if subset.empty:
+                scored = subset.dropna(subset=[prediction_column])
+                if scored.empty:
                     continue
-                actual, forecast = subset["actual"], subset[prediction_column]
+                actual, forecast = scored["actual"], scored[prediction_column]
                 rows.append({
                     "day_type": day_type,
                     "scope": scope,
@@ -161,6 +170,21 @@ def rolling_origin_validation(
                     "RMSE": mean_squared_error(actual, forecast) ** 0.5,
                     "underforecast_rate": ((actual - forecast) > 0).mean(),
                 })
+    # Peak-shaving relevance: compare each model's daily maximum with the
+    # actual daily maximum, restricted to genuine workdays.
+    workday = validation_predictions[validation_predictions["is_workday"]]
+    if not workday.empty:
+        daily_peaks = workday.groupby(workday.index.normalize())
+        for model_name, prediction_column in prediction_columns.items():
+            daily = daily_peaks[["actual", prediction_column]].max().dropna()
+            rows.append({
+                "day_type": "Working days",
+                "scope": "daily peak",
+                "model": model_name,
+                "MAE": mean_absolute_error(daily["actual"], daily[prediction_column]),
+                "RMSE": mean_squared_error(daily["actual"], daily[prediction_column]) ** 0.5,
+                "underforecast_rate": ((daily["actual"] - daily[prediction_column]) > 0).mean(),
+            })
     return validation_predictions, pd.DataFrame(rows).set_index(["day_type", "scope", "model"]).sort_index()
 
 
