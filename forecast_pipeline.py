@@ -100,8 +100,15 @@ def rolling_origin_validation(
     feature_columns: list[str],
     categorical_features: list[str],
     min_train_days: int = 28,
+    quantile: float = 0.95,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Predict each day from an expanding history and return predictions and metrics."""
+    """Predict each day from an expanding history and return predictions and metrics.
+
+    ``quantile`` controls the conservative LightGBM forecast (0.95 by
+    default for the presentation workflow); pass 0.80 for a P80 variant.
+    """
+    if not 0 < quantile < 1:
+        raise ValueError("quantile must be between 0 and 1")
     try:
         from lightgbm import LGBMRegressor
         lightgbm_available = True
@@ -136,12 +143,12 @@ def rolling_origin_validation(
             model.fit(train[feature_columns], train["load_target"], categorical_feature=categorical_features)
             result["lightgbm"] = model.predict(test[feature_columns])
 
-            p80_model = LGBMRegressor(
-                objective="quantile", alpha=0.80, n_estimators=100,
+            quantile_model = LGBMRegressor(
+                objective="quantile", alpha=quantile, n_estimators=100,
                 learning_rate=0.05, num_leaves=31, random_state=42, verbosity=-1,
             )
-            p80_model.fit(train[feature_columns], train["load_target"], categorical_feature=categorical_features)
-            result["lightgbm_p80"] = p80_model.predict(test[feature_columns])
+            quantile_model.fit(train[feature_columns], train["load_target"], categorical_feature=categorical_features)
+            result[f"lightgbm_p{int(quantile * 100)}"] = quantile_model.predict(test[feature_columns])
         predictions.append(result)
 
     validation_predictions = pd.concat(predictions).dropna(subset=["baseline_lag672"])
@@ -150,7 +157,9 @@ def rolling_origin_validation(
         "same-workday baseline": "baseline_same_workday",
     }
     if "lightgbm" in validation_predictions:
-        prediction_columns.update({"LightGBM": "lightgbm", "LightGBM P80": "lightgbm_p80"})
+        quantile_label = f"P{int(quantile * 100)}"
+        quantile_column = f"lightgbm_p{int(quantile * 100)}"
+        prediction_columns.update({"LightGBM": "lightgbm", f"LightGBM {quantile_label}": quantile_column})
 
     rows = []
     groups = [("Overall", validation_predictions)]

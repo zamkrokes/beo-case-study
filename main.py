@@ -11,7 +11,7 @@ def main(csv_path="load_timeseries_2025_case_study.csv"):
     df = load_and_prepare_data(csv_path)
     df, feature_columns, categorical_features = add_features(df)
     predictions, metrics = rolling_origin_validation(
-        df, feature_columns, categorical_features
+        df, feature_columns, categorical_features, quantile=0.95
     )
     return {"data": df, "predictions": predictions, "metrics": metrics}
 
